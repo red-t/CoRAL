@@ -68,9 +68,14 @@ class LongReadBamToBreakpointMetadata:
     lr_bamfh: pysam.AlignmentFile  # Long read bam file
     bam: bam_types.BAMWrapper
 
-    lr_graph: list[BreakpointGraph] = field(
-        default_factory=list
-    )  # Breakpoint graph
+    # --- chimeric mode additions ---
+    exogenous_bamfh: pysam.AlignmentFile | None = None
+    exogenous_bam: bam_types.BAMWrapper | None = None
+    force_min_support: int | None = None
+    # -------------------------------
+
+    # Breakpoint graphs for each amplicon
+    lr_graph: list[BreakpointGraph] = field(default_factory=list)
 
     # Tunable hyperparameters
     max_seq_len: int = 2000000  # Maximum allowed length for a breakpoint edge
@@ -160,6 +165,16 @@ class LongReadBamToBreakpointMetadata:
         self.cns_intervals_by_chr = cns_data.intervals_by_chr
         self.log2_cn = cns_data.log2_cn
 
+    def is_exogenous_contig(self, contig: str) -> bool:
+        # Prefer an explicit exogenous BAM when provided.
+        if self.exogenous_bamfh is None:
+            return False
+        try:
+            return contig in set(self.exogenous_bamfh.references)
+        except Exception:
+            logger.error(f"Error checking contig {contig} in exogenous BAM references.")
+            raise RuntimeError(f"Error checking contig {contig} in exogenous BAM references.")
+
     def read_cns(self, cns_file: io.TextIOWrapper) -> None:
         """Read in (cnvkit) *.cns file and estimate the normal long read coverage"""
         self.set_raw_cns_data(CNSSegData.from_file(cns_file))
@@ -205,12 +220,18 @@ class LongReadBamToBreakpointMetadata:
         logger.info(
             f"LR normal cov ={self.normal_cov}, {nnc=}, {total_int_len=}."
         )
+
+        # Original dynamic thresholding remains default.
         self.min_cluster_cutoff = max(
             self.min_cluster_cutoff,
             int(self.min_bp_cov_factor * self.normal_cov),
         )
-        logger.debug(f"Reset min_cluster_cutoff to {self.min_cluster_cutoff}.")
+        # If chimeric mode forces a hard cutoff, override after dynamic reset.
+        if self.force_min_support is not None and self.force_min_support > 0:
+            self.min_cluster_cutoff = int(self.force_min_support)
 
+        logger.debug(f"Reset min_cluster_cutoff to {self.min_cluster_cutoff}.")
+        
     def pos2cni(self, chr: str, pos: int) -> core_types.CNSIdx:
         return self.cns_tree[chr][pos]
 
@@ -539,13 +560,7 @@ class LongReadBamToBreakpointMetadata:
                 logger.info(f"\t\t\t\tNum long read support = {read_support}")
                 logger.info(f"\t\t\t\tbp_stats = {(bp_stats)}")
 
-                if (read_support < self.min_cluster_cutoff) and (
-                    read_support
-                    < max(
-                        self.normal_cov * self.min_bp_cov_factor,
-                        3.0,
-                    )
-                ):
+                if (read_support < self.min_cluster_cutoff):
                     logger.info("\t\t\tDiscarded the subcluster.")
                     num_subcluster += 1
                     continue
@@ -1140,17 +1155,16 @@ class LongReadBamToBreakpointMetadata:
         nm_threshold = (
             self.nm_stats[0] + 3 * self.nm_stats[1] if self.nm_filter else None
         )
+        
         for ai in self.amplicon_intervals:
-            for read in self.bam.fetch_interval(ai):
-                indel_alignments = (
-                    breakpoint_utilities.get_indel_alignments_from_read(
-                        ai.chr, read, self.min_del_len, nm_threshold
-                    )
+            bam = self.exogenous_bam if self.is_exogenous_contig(ai.chr) else self.bam
+            for read in bam.fetch_interval(ai):
+                indel_alignments = breakpoint_utilities.get_indel_alignments_from_read(
+                    ai.chr, read, self.min_del_len, nm_threshold
                 )
                 if indel_alignments:
-                    self.large_indel_alignments[read.query_name].extend(
-                        indel_alignments
-                    )
+                    self.large_indel_alignments[read.query_name].extend(indel_alignments)
+
         logger.info(
             f"Fetched {len(self.large_indel_alignments)} reads with large indels in CIGAR."
         )
@@ -1176,10 +1190,11 @@ class LongReadBamToBreakpointMetadata:
                         mapq2=-1,
                     )
                 )
+                
         logger.info(
             f"Found {len(new_bp_list_)} reads with new small del breakpoints."
         )
-
+        
         new_bp_clusters = cluster_bp_list(
             new_bp_list_,
             self.min_cluster_cutoff,
@@ -1422,6 +1437,72 @@ class LongReadBamToBreakpointMetadata:
                 )
                 logger.debug(f"LR cov assigned for concordant edge {ec}.")
 
+    def assign_cov_chimeric(self) -> None:
+        """Chimeric mode:
+        - sequence edge: contig 属于 exogenous -> exogenous_bam，否则 main_bam
+        - concordant edge: 任一端点 contig 属于 exogenous -> exogenous_bam，否则 main_bam
+        """
+        if self.exogenous_bamfh is None or self.exogenous_bam is None:
+            return self.assign_cov()
+
+        # sequence edges
+        for amplicon_idx in range(len(self.lr_graph)):
+            for seq_edge in self.lr_graph[amplicon_idx].sequence_edges:
+                if seq_edge.lr_count != -1:
+                    continue
+                use_exo = self.is_exogenous_contig(seq_edge.chr)
+                bamfh = self.exogenous_bamfh if use_exo else self.lr_bamfh
+                bamw = self.exogenous_bam if use_exo else self.bam
+                rl_list = [
+                    read
+                    for read in bamfh.fetch(
+                        seq_edge.chr, seq_edge.start, seq_edge.end + 1
+                    )
+                    if read.infer_read_length()
+                ]
+                seq_edge.lr_count = len(rl_list)
+                seq_edge.lr_nc = bamw.count_raw_coverage(seq_edge.interval)
+
+        # concordant edges
+        for amplicon_idx in range(len(self.lr_graph)):
+            bp_graph = self.lr_graph[amplicon_idx]
+            for eci, ec in enumerate(bp_graph.concordant_edges):
+                use_exo = self.is_exogenous_contig(ec.node1.chr) or self.is_exogenous_contig(ec.node2.chr)
+                bamfh = self.exogenous_bamfh if use_exo else self.lr_bamfh
+                bamw = self.exogenous_bam if use_exo else self.bam
+
+                rls = {read.query_name for read in bamw.fetch_node(ec.node1)}
+                rrs = {read.query_name for read in bamw.fetch_node(ec.node2)}
+                rls1 = {
+                    read.query_name
+                    for read in bamfh.fetch(
+                        contig=ec.node1.chr,
+                        start=ec.node1.pos - self.min_bp_match_cutoff_ - 1,
+                        stop=ec.node1.pos - self.min_bp_match_cutoff_,
+                    )
+                }
+                rrs1 = {
+                    read.query_name
+                    for read in bamfh.fetch(
+                        contig=ec.node2.chr,
+                        start=ec.node2.pos + self.min_bp_match_cutoff_,
+                        stop=ec.node2.pos + self.min_bp_match_cutoff_ + 1,
+                    )
+                }
+
+                rbps = set()
+                for bpi in bp_graph.node_adjacencies[ec.node1].discordant:
+                    for r in bp_graph.discordant_edges[bpi].alignments:
+                        rbps.add(r[0])
+                for bpi in bp_graph.node_adjacencies[ec.node2].discordant:
+                    for r in bp_graph.discordant_edges[bpi].alignments:
+                        rbps.add(r[0])
+
+                bp_graph.concordant_edges[eci].read_names = rls | rrs
+                bp_graph.concordant_edges[eci].lr_count = len(
+                    (rls & rrs & rls1 & rrs1) - rbps
+                )
+
     def compute_bp_graph_path_constraints(
         self, bp_graph: BreakpointGraph
     ) -> list[PathConstraint]:
@@ -1544,13 +1625,146 @@ class LongReadBamToBreakpointMetadata:
         )
         return bp_path_constraints
 
+    def compute_bp_graph_path_constraints_chimeric(
+        self, bp_graph: BreakpointGraph
+    ) -> list[PathConstraint]:
+        if self.exogenous_bamfh is None:
+            return self.compute_bp_graph_path_constraints(bp_graph)
+        
+        # ...same to original...
+        bp_path_constraints: list[PathConstraint] = []
+        read_to_alignments: defaultdict[str, BPIndexedAlignmentContainer] = (
+            defaultdict(BPIndexedAlignmentContainer)
+        )
+        concordant_reads = {}
+
+        for di, discordant_edge in enumerate(bp_graph.discordant_edges):
+            for bp_alignments in discordant_edge.alignments:
+                if bp_alignments.alignment1 == bp_alignments.alignment2:
+                    read_to_alignments[bp_alignments.name].equal.append(
+                        BPIndexedAlignments(
+                            alignment1=bp_alignments.alignment1,
+                            alignment2=bp_alignments.alignment2,
+                            discordant_idx=di,
+                        )
+                    )
+                else:
+                    read_to_alignments[bp_alignments.name].unequal.append(
+                        BPIndexedAlignments(
+                            alignment1=bp_alignments.alignment1,
+                            alignment2=bp_alignments.alignment2,
+                            discordant_idx=di,
+                        )
+                    )
+        logger.debug(
+            f"There are {len(read_to_alignments)} reads covering >=1 breakpoint"
+            f" in amplicon."
+        )
+
+        for rn, disc_alignments in read_to_alignments.items():
+            paths = path_utilities.get_bp_graph_paths(
+                bp_graph,
+                rn,
+                disc_alignments,
+                self.chimeric_alignments.get(rn, []),
+                self.large_indel_alignments.get(rn, []),
+                self.min_bp_match_cutoff_,
+            )
+
+            for path in paths:
+                if len(path) <= 5 or not path_constraints.valid_path(
+                    bp_graph, path
+                ):
+                    continue
+                existing_paths = [pc.path for pc in bp_path_constraints]
+                if path in existing_paths:
+                    pci = existing_paths.index(path)
+                    bp_path_constraints[pci].support += 1
+                elif path[::-1] in existing_paths:
+                    pci = existing_paths.index(path[::-1])
+                    bp_path_constraints[pci].support += 1
+                else:
+                    bp_path_constraints.append(
+                        PathConstraint(
+                            path=path,
+                            support=1,
+                            amplicon_id=bp_graph.amplicon_idx,
+                        )
+                    )
+        logger.debug(
+            f"There are {len(bp_path_constraints)} distinct "
+            f"subpaths due to reads involving breakpoints in amplicon "
+            f"{bp_graph.amplicon_idx + 1}."
+        )
+        # ...same to original...
+        
+        lc = len(bp_graph.concordant_edges)
+        for ci in range(lc):
+            for rn in bp_graph.concordant_edges[ci].read_names:
+                if (
+                    rn not in self.large_indel_alignments
+                    and rn not in self.chimeric_alignments
+                ):
+                    concordant_reads[rn] = bp_graph.amplicon_idx + 1
+        logger.debug(
+            f"There are {len(concordant_reads)} concordant reads within "
+            f"amplicon intervals in amplicon {bp_graph.amplicon_idx + 1}."
+        )
+
+        for aint in bp_graph.amplicon_intervals:
+            bamfh = (
+                self.exogenous_bamfh
+                if self.is_exogenous_contig(aint.chr)
+                else self.lr_bamfh
+            )
+            for read in bamfh.fetch(aint.chr, aint.start, aint.end + 1):
+                rn = read.query_name
+                if read.mapping_quality >= 20 and rn in concordant_reads:
+                    path = path_constraints.alignment_to_path(
+                        bp_graph,
+                        Interval(
+                            read.reference_name,
+                            read.reference_start,
+                            read.reference_end,
+                        ),
+                    )
+                    if len(path) <= 5 or not path_constraints.valid_path(
+                        bp_graph, path
+                    ):
+                        continue
+                    existing_paths = [pc.path for pc in bp_path_constraints]
+                    if path in existing_paths:
+                        pci = existing_paths.index(path)
+                        bp_path_constraints[pci].support += 1
+                    elif path[::-1] in existing_paths:
+                        pci = existing_paths.index(path[::-1])
+                        bp_path_constraints[pci].support += 1
+                    else:
+                        logger.info(
+                            f"Adding path {path} to path constraints, {aint=}"
+                        )
+                        bp_path_constraints.append(
+                            PathConstraint(
+                                path=path,
+                                support=1,
+                                amplicon_id=bp_graph.amplicon_idx,
+                            )
+                        )
+
+        logger.debug(
+            f"There are {len(bp_path_constraints)} distinct "
+            f"subpaths in amplicon {bp_graph.amplicon_idx + 1}."
+        )
+        return bp_path_constraints
+
     def compute_path_constraints(self) -> None:
         """Convert reads mapped within the amplicons into subpath constraints"""
         for amplicon_idx, bp_graph in enumerate(self.lr_graph):
             bp_graph.amplicon_idx = amplicon_idx
-            bp_path_constraints = self.compute_bp_graph_path_constraints(
-                bp_graph
-            )
+            if self.exogenous_bamfh is not None:
+                bp_path_constraints = self.compute_bp_graph_path_constraints_chimeric(bp_graph)
+            else:
+                bp_path_constraints = self.compute_bp_graph_path_constraints(bp_graph)
             bp_graph.path_constraints = bp_path_constraints
             bp_graph.longest_path_constraints = (
                 path_constraints.longest_path_dict(bp_path_constraints)
@@ -1559,6 +1773,8 @@ class LongReadBamToBreakpointMetadata:
     def closebam(self):
         """Close the short read and long read bam file"""
         self.lr_bamfh.close()
+        if self.exogenous_bamfh is not None:
+            self.exogenous_bamfh.close()
 
 
 @core_utils.profile_fn
@@ -1649,4 +1865,88 @@ def reconstruct_graphs(
         f"Wrote breakpoint graph for all complicons to {output_prefix}_amplicon*_graph.txt."
     )
 
+    return b2bn
+
+
+@core_utils.profile_fn
+def reconstruct_graphs_chimeric(
+    lr_bam_filename: pathlib.Path,
+    exogenous_bam_filename: pathlib.Path,
+    cnv_seed_file: typer.FileText,
+    cn_seg_file: typer.FileText,
+    output_prefix: str,
+    output_path_constraints: OutputPCOptions,
+    min_bp_support: float,
+    force_min_support: int | None = None,
+) -> LongReadBamToBreakpointMetadata:
+    """Chimeric reconstruction: supports a separate BAM containing exogenous contigs."""
+    seed_intervals = breakpoint_utilities.get_intervals_from_seed_file(cnv_seed_file)  # type: ignore[arg-type]
+
+    b2bn = LongReadBamToBreakpointMetadata(
+        lr_bamfh=pysam.AlignmentFile(str(lr_bam_filename), "rb"),
+        bam=bam_types.BAMWrapper(str(lr_bam_filename), "rb"),
+        exogenous_bamfh=pysam.AlignmentFile(str(exogenous_bam_filename), "rb"),
+        exogenous_bam=bam_types.BAMWrapper(str(exogenous_bam_filename), "rb"),
+        amplicon_intervals=seed_intervals,
+        force_min_support=force_min_support,
+    )
+    b2bn.min_bp_cov_factor = min_bp_support
+    logger.info("Opened LR bam files.")
+
+    b2bn.read_cns(cn_seg_file)
+    logger.info("Completed parsing CN segment files.")
+
+    pickle_path = pathlib.Path(f"{output_prefix}_chimeric_alignments.pickle")
+    if pickle_path.exists():
+        try:
+            with pickle_path.open("rb") as file:
+                chimeric_alignments = pickle.load(file)
+        except Exception as e:
+            logger.error(f"Unable to load chimeric alignments: {e}, re-fetching")
+            chimeric_alignments, edit_dist_stats = (
+                breakpoint_utilities.fetch_breakpoint_reads_chimeric(
+                    b2bn.bam, b2bn.exogenous_bam
+                )
+            )
+            with pickle_path.open("wb") as file:
+                pickle.dump(chimeric_alignments, file)
+    else:
+        start = time.time()
+        chimeric_alignments, edit_dist_stats = (
+            breakpoint_utilities.fetch_breakpoint_reads_chimeric(
+                b2bn.bam, b2bn.exogenous_bam
+            )
+        )
+        with pickle_path.open("wb") as file:
+            pickle.dump(chimeric_alignments, file)
+        logger.error(f"Time to fetch breakpoint reads: {time.time() - start}")
+    logger.info("Completed fetching reads containing breakpoints.")
+    
+    b2bn.hash_alignment_to_seg(chimeric_alignments)
+    
+    b2bn.find_amplicon_intervals()
+    logger.info("Completed finding amplicon intervals.")
+    b2bn.find_smalldel_breakpoints()
+    logger.info("Completed finding small del breakpoints.")
+    b2bn.find_breakpoints()
+    logger.info("Completed finding all discordant breakpoints.")
+    b2bn.build_graphs()
+    logger.info("Breakpoint graphs built for all amplicons.")
+    
+    b2bn.assign_cov_chimeric()
+    logger.info("Fetched read coverage for all sequence and concordant edges.")
+    for gi in range(len(b2bn.lr_graph)):
+        b2bn.lr_graph[gi].compute_cn_lr(b2bn.normal_cov)
+    logger.info("Computed CN for all edges.")
+
+    b2bn.compute_path_constraints()
+    logger.info("Computed all subpath constraints.")
+
+    for gi in range(len(b2bn.lr_graph)):
+        breakpoint_utilities.output_breakpoint_graph_lr(
+            b2bn.lr_graph[gi],
+            f"{output_prefix}_amplicon{gi+1}_graph.txt",
+            output_path_constraints,
+        )
+    logger.info(f"Wrote breakpoint graph for all complicons to {output_prefix}_amplicon*_graph.txt.")
     return b2bn

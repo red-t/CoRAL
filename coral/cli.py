@@ -56,6 +56,11 @@ BamArg = Annotated[
     pathlib.Path | None,
     typer.Option(help="Sorted indexed (long read) bam file."),
 ]
+ExoBamArg = Annotated[
+    pathlib.Path | None,
+    typer.Option(help="Sorted indexed BAM containing exogenous contigs (required)."),
+]
+
 CnvSeedArg = Annotated[
     typer.FileText, typer.Option(help="Bed file of CNV seed intervals.")
 ]
@@ -871,3 +876,110 @@ def plot_resource_usage(
     pathlib.Path(f"{output_prefix}").mkdir(parents=True, exist_ok=True)
 
     summary.parsing.plot_resource_usage(reconstruction_dir, output_prefix)
+
+
+@coral_app.command(
+    name="chimeric",
+    help="Reconstruct integration structures containing exogenous sequences"
+)
+def chimeric(
+    ctx: typer.Context,
+    output_prefix: OutputPrefixArg,
+    lr_bam: BamArg,
+    exo_bam: ExoBamArg,
+    cnv_seed: CnvSeedArg,
+    cn_seg: CnSegArg,
+    global_time_limit: GlobalTimeLimitArg = 21600,
+    cycle_decomp_mode: CycleDecompArg = CycleDecompOptions.MAX_WEIGHT,
+    cycle_decomp_alpha: AlphaArg = 0.01,
+    solver: SolverArg = Solver.GUROBI,
+    solver_time_limit: SolverTimeLimitArg = 7200,
+    solver_threads: ThreadsArg = -1,
+    output_path_constraints: OutputPCArg = OutputPCOptions.LONGEST,
+    postprocess_greedy_sol: PostProcessFlag = False,
+    skip_cycle_decomp: Annotated[
+        bool,
+        typer.Option(
+            help="If specified, only reconstruct and output the breakpoint graph for all amplicons.",
+        ),
+    ] = False,
+    min_bp_support: Annotated[
+        float,
+        typer.Option(
+            help="Ignore breakpoints with less than (min_bp_support * normal coverage) long read support (unless overridden)."
+        ),
+    ] = 1.0,
+    force_min_support: Annotated[
+        int,
+        typer.Option(
+            help="Force an absolute minimum breakpoint support cutoff (non-zero int). Overrides dynamic thresholding.",
+        ),
+    ] = 0,
+    ignore_path_constraints: IgnorePathConstraintsFlag = False,
+    profile: Annotated[bool, typer.Option(help="Profile resource usage.")] = False,
+    log_file: ReconstructLogArg = None,
+) -> None:
+    # Keep reconstruct unchanged; chimeric is a separate entry point.
+    print(
+        f"{colorama.Style.DIM}{colorama.Fore.LIGHTYELLOW_EX}"
+        f"Performing chimeric reconstruction with options: {ctx.params}"
+        f"{colorama.Style.RESET_ALL}"
+    )
+
+    solver_output_dir = pathlib.Path.cwd()
+    solver_output_prefix = output_prefix
+    if output_prefix.rfind("/") > 0:
+        solver_output_dir = output_prefix[: output_prefix.rfind("/")]
+        solver_output_prefix = output_prefix[output_prefix.rfind("/") + 1 :]
+    pathlib.Path(f"{solver_output_dir}/models").mkdir(parents=True, exist_ok=True)
+
+    log_fn = f"{output_prefix}_chimeric_reconstruct.log"
+    if log_file:
+        log_fn = log_file
+    logging.basicConfig(
+        filename=log_fn,
+        filemode="w+",
+        level=logging.DEBUG,
+        format="%(asctime)s:%(levelname)-4s [%(filename)s:%(lineno)d] %(message)s",
+    )
+    logging.getLogger("pyomo").setLevel(logging.INFO)
+
+    global_state.STATE_PROVIDER.should_profile = profile
+    global_state.STATE_PROVIDER.output_prefix = output_prefix
+    global_state.STATE_PROVIDER.time_limit_s = global_time_limit
+
+    forced = None if force_min_support == 0 else force_min_support
+    b2bn = infer_breakpoint_graph.reconstruct_graphs_chimeric(
+        lr_bam,
+        exo_bam,
+        cnv_seed,
+        cn_seg,
+        output_prefix,
+        output_path_constraints,
+        min_bp_support,
+        force_min_support=forced,
+    )
+
+    solver_options = datatypes.SolverOptions(
+        num_threads=solver_threads,
+        time_limit_s=solver_time_limit,
+        output_dir=solver_output_dir,
+        output_prefix=solver_output_prefix,
+        model_prefix="pyomo",
+        solver=solver,
+    )
+    if not skip_cycle_decomp:
+        cycle_decomposition.reconstruct_cycles(
+            b2bn.lr_graph,
+            solver_options,
+            cycle_decomp_mode,
+            cycle_decomp_alpha,
+            should_postprocess_greedy_sol=postprocess_greedy_sol,
+            pc_output_option=output_path_constraints,
+            ignore_path_constraints=ignore_path_constraints,
+        )
+
+    b2bn.closebam()
+    if profile:
+        summary.output.add_resource_usage_summary(solver_options)
+    print("\nCompleted chimeric reconstruction.")

@@ -801,6 +801,113 @@ def fetch_breakpoint_reads(
     return chimeric_alignments, edit_dist_stats
 
 
+def _alignment_to_sa_string(read: pysam.AlignedSegment) -> str | None:
+    """Convert a BAM alignment into a single SA tag entry string (no trailing ';').
+
+    SA format: rname,pos,strand,CIGAR,mapQ,NM
+    - pos is 1-based leftmost mapping position.
+    - strand is '+' or '-'.
+    - NM uses the NM tag if present, otherwise falls back to cigar_stats NM field.
+    """
+    if read.is_unmapped:
+        return None
+    if read.reference_name is None or read.cigarstring is None:
+        return None
+    strand = "-" if read.is_reverse else "+"
+    pos_1based = int(read.reference_start) + 1
+    try:
+        nm = int(read.get_tag("NM"))
+    except Exception:
+        try:
+            nm = int(read.get_cigar_stats()[0][-1])
+        except Exception:
+            nm = 0
+    return f"{read.reference_name},{pos_1based},{strand},{read.cigarstring},{int(read.mapping_quality)},{nm}"
+
+
+def fetch_breakpoint_reads_chimeric(
+    main_bam: pysam.AlignmentFile,
+    exogenous_bam: pysam.AlignmentFile,
+) -> tuple[dict[str, list[ChimericAlignment]], datatypes.BasicStatTracker]:
+    """Chimeric mode breakpoint-read fetching.
+
+    Implements:
+      1) traverse exogenous_bam -> exogenous_chimeric_strings
+      2) traverse main_bam -> main SA strings, ignoring SA entries that are exogenous;
+         if no SA and read appears in exogenous -> add main alignment as SA
+      3) merge & dedup SA strings per read
+      4) build ChimericAlignment objects
+    """
+    read_name_to_length: dict[str, int] = {}
+    exogenous_chimeric_strings: dict[str, list[str]] = defaultdict(list)
+    main_chimeric_strings: dict[str, list[str]] = defaultdict(list)
+    edit_dist_stats = datatypes.BasicStatTracker()
+    exogenous_contigs = set(exogenous_bam.references)
+
+    # Step 1: exogenous bam -> SA strings by read
+    read: bam_types.BAMRead
+    for read in exogenous_bam.fetch():
+        rn = read.query_name
+        if read.flag < 256 and rn not in read_name_to_length and read.query_length:
+            read_name_to_length[rn] = read.query_length
+        sa = _alignment_to_sa_string(read)
+        if sa is None:
+            continue
+        if sa not in exogenous_chimeric_strings[rn]:
+            exogenous_chimeric_strings[rn].append(sa)
+
+    # Step 2: main bam
+    for read in main_bam.fetch():
+        rn = read.query_name
+        if read.flag < 256 and rn not in read_name_to_length and read.query_length:
+            read_name_to_length[rn] = read.query_length
+
+        try:
+            sa_list = read.get_tag("SA:Z:")[:-1].split(";")  # type: ignore
+            for sa in sa_list:
+                # Skip SA entries belonging to exogenous contigs
+                ref = sa.split(",")[0]
+                if ref in exogenous_contigs:
+                    continue
+                if sa not in main_chimeric_strings[rn]:
+                    main_chimeric_strings[rn].append(sa)
+        except Exception:
+            # No SA tag
+            if rn in exogenous_chimeric_strings:
+                sa = _alignment_to_sa_string(read)
+                if sa is not None and sa not in main_chimeric_strings[rn]:
+                    main_chimeric_strings[rn].append(sa)
+            else:
+                # Preserve original edit-distance sampling behavior
+                if read.mapping_quality == 60 and read.query_length:
+                    e = read.get_cigar_stats()[0][-1] / read.query_length
+                    edit_dist_stats.observe(e)
+
+    # Step 3: merge main + exogenous SA strings
+    for rn in main_chimeric_strings:
+        for sa in exogenous_chimeric_strings.get(rn, []):
+            main_chimeric_strings[rn].append(sa)
+
+    # Step 4: build ChimericAlignment
+    logger.info(f"Fetched {len(main_chimeric_strings)} chimeric reads.")
+    reads_wo_primary_alignment = []
+    chimeric_alignments: dict[str, list[ChimericAlignment]] = {}
+    for r, sa_list in main_chimeric_strings.items():
+        if r not in read_name_to_length:
+            logger.warning(
+                f"Found chimeric read name {r} without primary alignment; Read length: N/A."
+            )
+            logger.warning(f"All CIGAR strings: {sa_list}.")
+            reads_wo_primary_alignment.append(r)
+            continue
+        chimeric_alignments[r] = cigar_parsing.alignment_from_satags(sa_list, r)
+
+    logger.info(
+        f"Computed alignment intervals on all {len(main_chimeric_strings)} chimeric reads.",
+    )
+    return chimeric_alignments, edit_dist_stats
+
+
 def get_cns_idx_intv_to_reads(
     d1_segs: dict[str, dict[int, set[str]]],
     cns_intervals_by_chr: dict[str, list[CNInterval]],
