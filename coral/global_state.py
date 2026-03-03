@@ -10,12 +10,20 @@ from dataclasses import dataclass, field
 
 from coral import datatypes
 from coral.datatypes import FnCall
+from coral.constants import DEFAULT_REFERENCE_CONTEXT, ReferenceContext
 
 # Time required to parse solution and generate summary file when we are unable
 # to run to completion (find optimal/best feasible solution for all provided
 # breakpoint graphs).
 CLEAN_EXIT_BUFFER_S = 10
 
+# Runtime reference context (contig order + lengths).
+# Initialized from input BAM header; falls back to constants.py defaults.
+REFERENCE_CONTEXT: ReferenceContext = DEFAULT_REFERENCE_CONTEXT
+
+def set_reference_context(ctx: ReferenceContext) -> None:
+    global REFERENCE_CONTEXT
+    REFERENCE_CONTEXT = ctx
 
 @dataclass
 class GlobalStateProvider:

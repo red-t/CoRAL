@@ -4,9 +4,8 @@ import io
 import logging
 import pathlib
 
-from coral import core_utils
+from coral import core_utils, global_state
 from coral.breakpoint.breakpoint_graph import BreakpointGraph
-from coral.constants import CHR_TAG_TO_IDX
 from coral.datatypes import FinalizedPathConstraint, OutputPCOptions, Walk
 from coral.output.utils import (
     get_single_cycle_str,
@@ -30,9 +29,10 @@ def output_amplicon_walks(
     fp = cycle_path.open("w")
 
     interval_num = 1
+    chr_tag_to_idx = global_state.REFERENCE_CONTEXT.chr_tag_to_idx
     ai_amplicon = sorted(
         bp_graph.amplicon_intervals,
-        key=lambda ai: (CHR_TAG_TO_IDX[ai.chr], ai.start),
+        key=lambda ai: (chr_tag_to_idx.get(ai.chr, 10**9), ai.start),
     )
     for ai in ai_amplicon:
         fp.write(f"Interval\t{interval_num}\t{ai.chr}\t{ai.start}\t{ai.end}\n")

@@ -1,6 +1,9 @@
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Mapping
+
 # Map a strand to its opposite strand
 INVERT_STRAND_DIRECTION = {"+": "-", "-": "+"}
-
 
 # Sorted chromosome names
 CHR_TAG_TO_IDX = {
@@ -58,6 +61,46 @@ CHR_SIZES = {
     "chrY": 57227415,
 }
 
+@dataclass(frozen=True)
+class ReferenceContext:
+    """Runtime reference metadata derived from an input BAM header."""
+    chr_tag_to_idx: dict[str, int]
+    chr_sizes: dict[str, int]
+
+    @classmethod
+    def from_bam_header(
+        cls,
+        header: Mapping,
+        *,
+        prefer_bam_order: bool = True,
+    ) -> "ReferenceContext":
+        """
+        Build contig order/lengths from BAM header @SQ records.
+
+        header: pysam.AlignmentFile.header (dict-like)
+        """
+        sq = header.get("SQ", [])
+        sizes: dict[str, int] = {}
+        contigs: list[str] = []
+        for rec in sq:
+            sn = rec.get("SN")
+            ln = rec.get("LN")
+            if sn is None or ln is None:
+                continue
+            sn = str(sn)
+            sizes[sn] = int(ln)
+            contigs.append(sn)
+
+        if not prefer_bam_order:
+            contigs = sorted(contigs)
+
+        chr_tag_to_idx = {c: i for i, c in enumerate(contigs)}
+        return cls(chr_tag_to_idx=chr_tag_to_idx, chr_sizes=sizes)
+
+DEFAULT_REFERENCE_CONTEXT = ReferenceContext(
+    chr_tag_to_idx=dict(CHR_TAG_TO_IDX),
+    chr_sizes=dict(CHR_SIZES),
+)
 
 CNSIZE_MAX = 5000001  # Not parameterized
 

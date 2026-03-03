@@ -32,6 +32,8 @@ from coral.core_utils import (
 from coral.datatypes import CycleDecompOptions, OutputPCOptions, Solver
 from coral.output import cycle_output
 from coral.scoring import score_simulation
+import pysam
+from coral.constants import ReferenceContext
 
 colorama.init()
 coral_app = typer.Typer(
@@ -49,6 +51,16 @@ def validate_cns_file(cns_file: typer.FileText) -> typer.FileText:
     raise typer.BadParameter(
         "Invalid cn-seg file format! (Only .bed and .cns formats are supported.)"
     )
+
+
+def _init_reference_context(bam_path: pathlib.Path | None) -> None:
+    # NOTE: This updates global_state.REFERENCE_CONTEXT for downstream sorting/length lookups.
+    if bam_path is None:
+        return
+    with pysam.AlignmentFile(str(bam_path), "rb") as bamfh:
+        global_state.set_reference_context(
+            ReferenceContext.from_bam_header(bamfh.header)
+        )
 
 
 # Note: typer.Arguments are required, typer.Options are optional
@@ -140,6 +152,7 @@ def seed(
     ctx: typer.Context,
     cn_seg: CnSegArg,
     output_prefix: OutputPrefixArg,
+    lr_bam: BamArg,
     gain: Annotated[
         float,
         typer.Option(
@@ -166,6 +179,8 @@ def seed(
     )
     if "/" in output_prefix:
         os.makedirs(os.path.dirname(output_prefix), exist_ok=True)
+        
+    _init_reference_context(lr_bam)
     run_seeding(cn_seg, output_prefix, gain, min_seed_size, max_seg_gap)
 
 
@@ -232,6 +247,7 @@ def reconstruct(
     global_state.STATE_PROVIDER.output_prefix = output_prefix
     global_state.STATE_PROVIDER.time_limit_s = global_time_limit
 
+    _init_reference_context(lr_bam)
     b2bn = infer_breakpoint_graph.reconstruct_graphs(
         lr_bam,
         cnv_seed,
@@ -273,6 +289,7 @@ def cycle_decomposition_mode(
     bp_graph: Annotated[
         typer.FileText, typer.Option(help="Existing BP graph file.")
     ],
+    lr_bam: BamArg,
     output_prefix: OutputPrefixArg,
     alpha: AlphaArg = 0.01,
     solver_time_limit: SolverTimeLimitArg = 7200,
@@ -294,6 +311,7 @@ def cycle_decomposition_mode(
         f"{colorama.Style.RESET_ALL}"
     )
 
+    _init_reference_context(lr_bam)
     solver_output_dir = pathlib.Path.cwd()
     solver_output_prefix = output_prefix
     if output_prefix.rfind("/") > 0:
@@ -770,6 +788,7 @@ def cycle2bed_mode(
         ),
     ],
     output_file: Annotated[str, typer.Option(help="Output file name.")],
+    lr_bam: BamArg = None,
     num_cycles: Annotated[
         int | None, typer.Option(help="Only plot the first NUM_CYCLES cycles.")
     ] = None,
@@ -785,8 +804,10 @@ def cycle2bed_mode(
         f"Performing cycle to bed mode with options: {ctx.params}"
         f"{colorama.Style.RESET_ALL}"
     )
+    
+    _init_reference_context(lr_bam)
     cycle2bed.convert_cycles_to_bed(
-        cycle_file, output_file, rotate_to_min, num_cycles, print_command = True
+        cycle_file, output_file, rotate_to_min, num_cycles, print_command=True
     )
 
 
@@ -947,7 +968,8 @@ def chimeric(
     global_state.STATE_PROVIDER.should_profile = profile
     global_state.STATE_PROVIDER.output_prefix = output_prefix
     global_state.STATE_PROVIDER.time_limit_s = global_time_limit
-
+    
+    _init_reference_context(lr_bam)
     forced = None if force_min_support == 0 else force_min_support
     b2bn = infer_breakpoint_graph.reconstruct_graphs_chimeric(
         lr_bam,

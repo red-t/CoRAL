@@ -6,7 +6,8 @@ from typing import Any
 
 import typer
 
-from coral.constants import CHR_TAG_TO_IDX, INVERT_STRAND_DIRECTION
+from coral import global_state
+from coral.constants import INVERT_STRAND_DIRECTION
 
 
 def convert_cycles_to_bed(
@@ -19,6 +20,7 @@ def convert_cycles_to_bed(
     """Convert an AA-formatted .txt file into equivalent .bed representation."""
     all_segs: dict[str, list[str | int]] = dict()
     cycles: dict[int, list[Any]] = dict()
+    chr_tag_to_idx = global_state.REFERENCE_CONTEXT.chr_tag_to_idx
     for line in cycle_file:
         t = line.strip().split()
         if t[0] == "Segment":
@@ -81,7 +83,7 @@ def convert_cycles_to_bed(
                     argmin_idx = cycle.index(
                         min(
                             cycle,
-                            key=lambda seg: (CHR_TAG_TO_IDX[seg[0]], seg[1]),  # type: ignore[index]
+                            key=lambda seg: (chr_tag_to_idx.get(seg[0], 10**9), seg[1]),  # type: ignore[index]
                         ),
                     )
                     if cycle[argmin_idx][-1] == "+":
@@ -92,21 +94,21 @@ def convert_cycles_to_bed(
                             + cycle[argmin_idx + 1 :][::-1]
                         )
                         for idx in range(len(cycle)):
-                            cycle[idx][-1] = INVERT_STRAND_DIRECTION(
+                            cycle[idx][-1] = INVERT_STRAND_DIRECTION[
                                 cycle[idx][-1]
-                            )  # type: ignore[operator]
-                elif CHR_TAG_TO_IDX[cycle[-1][0]] < CHR_TAG_TO_IDX[  # type: ignore[index]
-                    cycle[0][0]  # type: ignore[index]
-                ] or (
-                    CHR_TAG_TO_IDX[cycle[-1][0]] == CHR_TAG_TO_IDX[cycle[0][0]]  # type: ignore[index]
+                            ]  # type: ignore[index]
+                elif chr_tag_to_idx.get(cycle[-1][0], 10**9) < chr_tag_to_idx.get(  # type: ignore[index]
+                    cycle[0][0], 10**9  # type: ignore[index]
+                ) or (
+                    chr_tag_to_idx.get(cycle[-1][0], 10**9) == chr_tag_to_idx.get(cycle[0][0], 10**9)  # type: ignore[index]
                     and cycle[-1][1] < cycle[-1][1]  # type: ignore[index, operator]
                 ):
                     cycle = cycle[::-1]
                     if cycle[0][-1] == "-":
                         for idx in range(len(cycle)):
-                            cycle[idx][-1] = INVERT_STRAND_DIRECTION(
+                            cycle[idx][-1] = INVERT_STRAND_DIRECTION[
                                 cycle[idx][-1]
-                            )  # type: ignore[operator]
+                            ]  # type: ignore[index]
             cycles[int(cycle_id)] = [iscyclic, cycle_weight, cycle]
 
     if print_command:

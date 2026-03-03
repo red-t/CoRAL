@@ -17,7 +17,7 @@ import numpy as np
 import pysam
 import typer
 
-from coral import bam_types, core_types, core_utils
+from coral import bam_types, core_types, core_utils, global_state
 from coral.breakpoint import breakpoint_utilities, path_utilities
 from coral.breakpoint.breakpoint_graph import BreakpointGraph
 from coral.breakpoint.breakpoint_types import CNSSegData
@@ -29,7 +29,6 @@ from coral.breakpoint.breakpoint_utilities import (
     interval_exclusive,
     interval_overlap_l,
 )
-from coral.constants import CHR_TAG_TO_IDX
 from coral.datatypes import (
     AmpliconInterval,
     BPAlignments,
@@ -937,8 +936,9 @@ class LongReadBamToBreakpointMetadata:
             except:
                 logger.exception(f"Unable to parse {bp=}")
 
+        chr_tag_to_idx = global_state.REFERENCE_CONTEXT.chr_tag_to_idx
         return sorted(same_chr_segs), sorted(
-            diff_chr_segs, key=lambda item: (CHR_TAG_TO_IDX[item[0]], item[1:])
+            diff_chr_segs, key=lambda item: (chr_tag_to_idx.get(item[0], 10**9), item[1:])
         )
 
     def find_interval_i(self, ai: int, ccid: int) -> None:
@@ -997,9 +997,10 @@ class LongReadBamToBreakpointMetadata:
             new_intervals_refined: list[AmpliconInterval] = []
             new_intervals_connections: list[list[core_types.BPIdx]] = []
 
+            chr_tag_to_idx = global_state.REFERENCE_CONTEXT.chr_tag_to_idx
             for chr_, cni_to_reads in sorted(
                 chr_to_cni_to_reads.items(),
-                key=lambda item: CHR_TAG_TO_IDX[item[0]],
+                key=lambda item: chr_tag_to_idx.get(item[0], 10**9),
             ):
                 # Verify if there are any CN segments on this chr
                 if len(cni_to_reads) == 0:

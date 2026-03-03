@@ -21,8 +21,7 @@ from typing import (
 import numpy as np
 import pysam
 
-from coral import bam_types, cigar_parsing, core_types, core_utils, datatypes
-from coral.constants import CHR_TAG_TO_IDX
+from coral import bam_types, cigar_parsing, core_types, core_utils, datatypes, global_state
 from coral.datatypes import (
     AmpliconInterval,
     BPAlignments,
@@ -384,10 +383,9 @@ def interval2bp(
     Convert split/chimeric alignment to breakpoint
     """
     intv1, intv2 = chimera1.ref_interval, chimera2.ref_interval
-    chr_idx1, chr_idx2 = (
-        CHR_TAG_TO_IDX[intv1.chr],
-        CHR_TAG_TO_IDX[intv2.chr],
-    )
+    chr_tag_to_idx = global_state.REFERENCE_CONTEXT.chr_tag_to_idx
+    chr_idx1 = chr_tag_to_idx.get(intv1.chr, 10**9)
+    chr_idx2 = chr_tag_to_idx.get(intv2.chr, 10**9)
     if (chr_idx2 < chr_idx1) or (
         chr_idx2 == chr_idx1 and intv2.start < intv1.end
     ):
@@ -551,9 +549,11 @@ def bp_match(
 
 
 def sort_chrom_names(chromlist: Iterable[str]) -> list[str]:
+    chr_tag_to_idx = global_state.REFERENCE_CONTEXT.chr_tag_to_idx
+
     def sort_key(x: str) -> int:
         chr_val = x if x.startswith("chr") else ("chr" + x)
-        return CHR_TAG_TO_IDX[chr_val]
+        return chr_tag_to_idx.get(chr_val, 10**9)
 
     return sorted(chromlist, key=sort_key)
 

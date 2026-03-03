@@ -18,8 +18,7 @@ import intervaltree
 import numpy as np
 import pyomo.environ as pyo
 
-from coral import core_types, text_utils
-from coral.constants import CHR_TAG_TO_IDX
+from coral import core_types, text_utils, global_state
 
 if TYPE_CHECKING:
     from coral.breakpoint.breakpoint_graph import BreakpointGraph
@@ -153,11 +152,10 @@ class Interval:
         return self.end - self.start + 1
 
     def __lt__(self, other: Interval) -> bool:
-        return (CHR_TAG_TO_IDX[self.chr], self.start, self.end) < (
-            CHR_TAG_TO_IDX[other.chr],
-            other.start,
-            other.end,
-        )
+        chr_tag_to_idx = global_state.REFERENCE_CONTEXT.chr_tag_to_idx
+        self_chr_i = chr_tag_to_idx.get(self.chr, 10**9)
+        other_chr_i = chr_tag_to_idx.get(other.chr, 10**9)
+        return (self_chr_i, self.start, self.end) < (other_chr_i, other.start, other.end)
 
     def __str__(self) -> str:
         return f"{self.chr}:{self.start:,d}-{self.end:,d}"
@@ -402,15 +400,16 @@ class Breakpoint:
         )
 
     def __lt__(self, other: Breakpoint) -> bool:
+        chr_tag_to_idx = global_state.REFERENCE_CONTEXT.chr_tag_to_idx
         return (
-            CHR_TAG_TO_IDX[self.node1.chr],
+            chr_tag_to_idx.get(self.node1.chr, 10**9),
             self.node1.pos,
-            CHR_TAG_TO_IDX[self.node2.chr],
+            chr_tag_to_idx.get(self.node2.chr, 10**9),
             self.node2.pos,
         ) < (
-            CHR_TAG_TO_IDX[other.node1.chr],
+            chr_tag_to_idx.get(other.node1.chr, 10**9),
             other.node1.pos,
-            CHR_TAG_TO_IDX[other.node2.chr],
+            chr_tag_to_idx.get(other.node2.chr, 10**9),
             other.node2.pos,
         )
 
@@ -675,8 +674,9 @@ class SequenceEdge:
         return f"SeqEdge({self.chr}-{self.start:,d}-{self.end:,d})"
 
     def __lt__(self, other: SequenceEdge) -> bool:
-        return (CHR_TAG_TO_IDX[self.chr], self.start, self.end) < (
-            CHR_TAG_TO_IDX[other.chr],
+        chr_tag_to_idx = global_state.REFERENCE_CONTEXT.chr_tag_to_idx
+        return (chr_tag_to_idx.get(self.chr, 10**9), self.start, self.end) < (
+            chr_tag_to_idx.get(other.chr, 10**9),
             other.start,
             other.end,
         )
@@ -710,15 +710,16 @@ class BreakpointEdge:
     cn: float = 0.0  # Edge Copy Number
 
     def __lt__(self, other: BreakpointEdge) -> bool:
+        chr_tag_to_idx = global_state.REFERENCE_CONTEXT.chr_tag_to_idx
         return (
-            CHR_TAG_TO_IDX[self.node1.chr],
+            chr_tag_to_idx.get(self.node1.chr, 10**9),
             self.node1.pos,
-            CHR_TAG_TO_IDX[self.node2.chr],
+            chr_tag_to_idx.get(self.node2.chr, 10**9),
             self.node2.pos,
         ) < (
-            CHR_TAG_TO_IDX[other.node1.chr],
+            chr_tag_to_idx.get(other.node1.chr, 10**9),
             other.node1.pos,
-            CHR_TAG_TO_IDX[other.node2.chr],
+            chr_tag_to_idx.get(other.node2.chr, 10**9),
             other.node2.pos,
         )
 

@@ -7,14 +7,14 @@ import os
 
 import typer
 
-from coral import supplemental_data
-from coral.constants import CHR_SIZES, CNSIZE_MAX
+from coral import supplemental_data, global_state
+from coral.constants import CNSIZE_MAX
 from coral.datatypes import ChrArmInfo, CNInterval, Interval, SingleArmInfo
 
 logger = logging.getLogger(__name__)
 
 
-def parse_centromere_arms() -> dict[str, ChrArmInfo]:
+def parse_centromere_arms(chr_sizes: dict[str, int]) -> dict[str, ChrArmInfo]:
     chr_arms: dict[str, ChrArmInfo] = {}
 
     with (
@@ -35,7 +35,7 @@ def parse_centromere_arms() -> dict[str, ChrArmInfo]:
                 interval=full_intv,
                 p_arm=SingleArmInfo(p_intv, size=p_intv.end),
                 q_arm=SingleArmInfo(
-                    q_intv, size=CHR_SIZES[p_intv.chr] - q_intv.end
+                    q_intv, size=chr_sizes[p_intv.chr] - q_intv.end
                 ),
             )
             p_line = fp.readline()
@@ -83,7 +83,7 @@ def run_seeding(
 
     """
 
-    chr_arms = parse_centromere_arms()
+    chr_arms = parse_centromere_arms(global_state.REFERENCE_CONTEXT.chr_sizes)
     cnv_seeds: list[list[CNInterval]] = []
     cur_seed: list[CNInterval] = []
     for line in cn_seg_file:
